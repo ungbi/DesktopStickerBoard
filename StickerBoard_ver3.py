@@ -1,10 +1,11 @@
 import sys, os, platform, ctypes, json, math
+from ctypes import wintypes
 from typing import Optional, List, Dict
 
 from PySide6.QtCore import Qt, QPoint, QRect, QSize, Signal, QLockFile, QTimer, QEvent
 from PySide6.QtGui import (
     QPixmap, QGuiApplication, QPainter, QImageReader, QPixmapCache,
-    QCursor, QColor, QPainterPath, QPolygon, QMovie
+    QCursor, QColor, QPainterPath, QPolygon, QMovie, QPen, QBrush
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QToolButton, QMenu,
@@ -36,6 +37,27 @@ ROT_EXTRA_GAP = 12
 MIN_SIDE = 64  # 짧은 변 최소 보장 (비율 유지)
 
 IS_EXITING = False
+
+
+# ================== Windows: 확실한 TopMost/NotTopMost 적용 유틸 ==================
+def _win_set_topmost(hwnd: int, on: bool):
+    if platform.system() != "Windows":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOACTIVATE = 0x0010
+        user32.SetWindowPos(
+            wintypes.HWND(hwnd),
+            wintypes.HWND(HWND_TOPMOST if on else HWND_NOTOPMOST),
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        )
+    except Exception:
+        pass
 
 
 # ================== 저장 매니저 ==================
@@ -223,6 +245,7 @@ class StickerWindow(QWidget):
         # 상태
         self.dragging = False
         self.resizing = False
+        not_used = False
         self.rotating = False
         self.resize_margin = 18
         self.rotate_scale = 0.5
@@ -278,9 +301,7 @@ class StickerWindow(QWidget):
         if image_path.lower().endswith(".gif"):
             mv = QMovie(image_path)
             if mv.isValid():
-                # 메모리 최소화
-                mv.setCacheMode(QMovie.CacheNone)
-                # 기본 크기에서 1:1로 그리도록 프레임 스케일 설정
+                mv.setCacheMode(QMovie.CacheNone)  # 메모리 최소화
                 mv.setScaledSize(QSize(self.base_w, self.base_h))
                 mv.frameChanged.connect(self.update)
                 mv.start()
@@ -338,7 +359,9 @@ class StickerWindow(QWidget):
         if start_pos:
             self.move(start_pos)
         if initial_topmost:
+            # 즉시 적용 + 1틱 후 재적용으로 OS z-order 보정
             self._apply_topmost(True)
+            QTimer.singleShot(0, lambda: self._apply_topmost(True))
 
         self._place_overlay_controls()
         self._apply_rotated_rect_mask()
@@ -389,10 +412,8 @@ class StickerWindow(QWidget):
             except Exception:
                 pos = self.rect().center()
         inside = self._is_pos_in_image(pos)
-        # 버튼들
         self.btn_close.setVisible(inside)
         self.btn_rotate.setVisible(inside)
-        # 리사이즈 핸들(삼각형) hover 때만
         if getattr(self, "_show_resize_handle", False) != inside:
             self._show_resize_handle = inside
             self.update()
@@ -410,7 +431,7 @@ class StickerWindow(QWidget):
         p_close = self._map_image_center_to_widget(*close_anchor_img)
         self.btn_close.move(int(p_close.x() - CLOSE_BTN_W//2),
                             int(p_close.y() - CLOSE_BTN_H//2))
-        # rotate (고정 간격)
+        # rotate
         rotate_gap = ROT_EXTRA_GAP + (CLOSE_BTN_W + ROT_BTN_W) / 2.0
         rotate_anchor_img = (w/2 - pad - rotate_gap,
                              -h/2 + pad + (ROT_BTN_H/2))
@@ -418,7 +439,7 @@ class StickerWindow(QWidget):
         self.btn_rotate.move(int(p_rot.x() - ROT_BTN_W//2),
                              int(p_rot.y() - ROT_BTN_H//2))
 
-        # 리사이즈 핸들 삼각형 (오른쪽-아래 모서리)
+        # 리사이즈 핸들 삼각형
         s = self.resize_margin
         p1 = self._map_image_center_to_widget(w/2,     h/2)
         p2 = self._map_image_center_to_widget(w/2 - s, h/2)
@@ -470,7 +491,6 @@ class StickerWindow(QWidget):
             self._pos_fix_applied = True
 
     def hideEvent(self, e):
-        # 보이지 않을 때 애니메이션 일시정지 → CPU 절약 (기능 영향 없음)
         try:
             if self.movie and self.movie.isValid():
                 self.movie.setPaused(True)
@@ -479,7 +499,6 @@ class StickerWindow(QWidget):
         return super().hideEvent(e)
 
     def show(self):
-        # 다시 보이면 재개
         super().show()
         try:
             if self.movie and self.movie.isValid():
@@ -494,13 +513,20 @@ class StickerWindow(QWidget):
 
         draw_w, draw_h = self._current_image_w_h()
 
-        # === 이미지/무비 그리기 ===
+        # ===== 회전시에도 부드럽게 보이도록 항상 스무딩 켜기 =====
+        # (스케일 여부와 무관하게 회전 각도가 0이 아니면 강제 활성화)
+        def _set_smooth(scaling: bool):
+            if self.rotation_angle or scaling:
+                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            else:
+                p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+
         if self.movie and self.movie.isValid():
             frame = self.movie.currentPixmap()
             if not frame.isNull():
                 base_w, base_h = frame.width(), frame.height()
                 scaling = (draw_w != base_w) or (draw_h != base_h)
-                p.setRenderHint(QPainter.SmoothPixmapTransform, bool(scaling))
+                _set_smooth(scaling)
                 p.save()
                 cx, cy = r.center().x(), r.center().y()
                 p.translate(cx, cy)
@@ -515,7 +541,7 @@ class StickerWindow(QWidget):
             if not pm.isNull():
                 base_w, base_h = self.base_w, self.base_h
                 scaling = (draw_w != base_w) or (draw_h != base_h)
-                p.setRenderHint(QPainter.SmoothPixmapTransform, bool(scaling))
+                _set_smooth(scaling)
                 p.save()
                 cx, cy = r.center().x(), r.center().y()
                 p.translate(cx, cy)
@@ -526,10 +552,14 @@ class StickerWindow(QWidget):
                 p.drawPixmap(QRect(-base_w // 2, -base_h // 2, base_w, base_h), pm)
                 p.restore()
 
-        # === 리사이즈 핸들 ===
+        # ===== 리사이즈 삼각 버튼: 검은 테두리, 흰색 채움 =====
         if (not self.locked) and self._resize_tri is not None and self._show_resize_handle:
-            p.setOpacity(0.30)
+            p.save()
+            p.setOpacity(0.95)
+            p.setPen(QPen(Qt.black, 1.5))
+            p.setBrush(QBrush(Qt.white))
             p.drawPath(self._resize_tri)
+            p.restore()
 
     # 회전
     def _begin_rotate_by_button(self):
@@ -630,7 +660,6 @@ class StickerWindow(QWidget):
             s_raw = (vxi * bx + vyi * by) / float(denom)
             s_raw = max(0.1, s_raw)
 
-            # 스무딩: EMA
             alpha = 0.4
             self._scale_ema = (1 - alpha) * self._scale_ema + alpha * s_raw
             s = self._scale_ema
@@ -654,7 +683,6 @@ class StickerWindow(QWidget):
             new_x = int(round(new_center_global.x() - required_side / 2.0))
             new_y = int(round(new_center_global.y() - required_side / 2.0))
 
-            # 2px 임계값: 미세 변동은 건너뛰기
             g = self.geometry()
             need_apply = (
                 abs(g.x() - new_x) >= 2 or
@@ -667,7 +695,6 @@ class StickerWindow(QWidget):
                 self.setGeometry(new_x, new_y, required_side, required_side)
                 self._place_overlay_controls()
                 self._apply_rotated_rect_mask_throttled()
-                # GIF는 리사이즈 중에도 프레임 크기 동기화 → 품질/부하 균형
                 if self.movie and self.movie.isValid():
                     self.movie.setScaledSize(QSize(new_w, new_h))
                 self.setUpdatesEnabled(True)
@@ -694,7 +721,6 @@ class StickerWindow(QWidget):
         anchor = self._resize_anchor_pt or self._image_top_left_global(w_cur, h_cur)
 
         self.base_w, self.base_h = self._resizing_pending_size
-        # 정지/애니메이션 각각 업데이트
         if self.movie and self.movie.isValid():
             self.movie.setScaledSize(QSize(self.base_w, self.base_h))
         else:
@@ -762,12 +788,28 @@ class StickerWindow(QWidget):
 
     # ======= 상단/하단 플래그 =======
     def _set_topmost_flags(self, on: bool):
-        self.setWindowFlag(WT("WindowStaysOnTopHint"), on)
-        self.setWindowFlag(WT("WindowStaysOnBottomHint"), not on)
+        # 기존 플래그를 모두 제거 후 원하는 플래그만 세팅
+        flags = self.windowFlags()
+        flags &= ~WT("WindowStaysOnTopHint")
+        flags &= ~WT("WindowStaysOnBottomHint")
+        if on:
+            flags |= WT("WindowStaysOnTopHint")
+        else:
+            flags |= WT("WindowStaysOnBottomHint")
+        self.setWindowFlags(flags)
 
     def _apply_topmost(self, on: bool):
         self._set_topmost_flags(on)
         self.show()
+        if on:
+            self.raise_()
+        if platform.system() == "Windows":
+            try:
+                hwnd = int(self.winId())
+                _win_set_topmost(hwnd, on)
+                QTimer.singleShot(0, lambda: _win_set_topmost(hwnd, on))
+            except Exception:
+                pass
 
     # 컨텍스트 메뉴
     def _on_menu(self, act):
@@ -841,7 +883,6 @@ class StickerWindow(QWidget):
             self.base_w, self.base_h = bw, bh
             self.aspect_ratio = (bw / bh) if bh > 0 else self.aspect_ratio
 
-            # 리소스(정지/무비) 갱신
             if self.movie and self.movie.isValid():
                 self.movie.setScaledSize(QSize(self.base_w, self.base_h))
             else:
@@ -860,9 +901,12 @@ class StickerWindow(QWidget):
                 y = int(st.get("y", self.y()))
                 cx, cy = x + required_side // 2, y + required_side // 2
 
+            # 플래그 먼저 적용 + 0틱 후 재적용으로 확실히 고정
             self._set_topmost_flags(topmost)
             self.setGeometry(int(cx - required_side/2), int(cy - required_side/2),
                              required_side, required_side)
+            QTimer.singleShot(0, lambda: self._apply_topmost(topmost))
+
             self._saved_center = QPoint(cx, cy)
             self._pos_fix_applied = False
 
@@ -998,7 +1042,7 @@ class StickerToolbar(QMainWindow):
     def create_sticker(self, path: str, pos: Optional[QPoint] = None, *, show_now: bool = True, initial_topmost: bool = True) -> Optional[StickerWindow]:
         if not path or not os.path.exists(path):
             return None
-        s = StickerWindow(path, start_pos=pos, initial_topmost=initial_topmost)
+        s = StickerWindow(path, start_pos=pos, initial_topmost=initial_topmost)  # 기본 True
         s.stateChanged.connect(self.save_all)
         s.destroyed.connect(lambda *_: self._cleanup_and_save(s))
         if show_now:
@@ -1015,7 +1059,7 @@ class StickerToolbar(QMainWindow):
 
     def build_state(self) -> Dict:
         return {
-            "version": 21,  # GIF 지원, 메모리 최적화
+            "version": 23,  # TopMost SetWindowPos 보강
             "toolbar": {
                 "x": int(self.x()), "y": int(self.y()),
                 "visible": not self.isHidden(),
@@ -1065,7 +1109,7 @@ class StickerToolbar(QMainWindow):
 # ================== Main ==================
 def main():
     try:
-        QPixmapCache.setCacheLimit(16 * 1024)  # 16MB (KB) - 전역 캐시 상한
+        QPixmapCache.setCacheLimit(16 * 1024)  # 16MB (KB)
     except Exception:
         pass
 
